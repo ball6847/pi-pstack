@@ -58,6 +58,41 @@ This port deliberately removes Cursor-only setup and behavior:
 
 The extension requests confirmation for recognizable shell commands that push, alter pull requests, merge, deploy, mutate infrastructure, or recursively delete files. In non-interactive mode it blocks these commands. This is a guardrail, not a complete shell-security sandbox. Prompts also require explicit approval for all external or irreversible actions.
 
+### Confirmation gate
+
+This fork adds a flag for that gate. It has three modes:
+
+| Mode | What prompts |
+|---|---|
+| `strict` *(default)* | Every pattern above, exactly as upstream. |
+| `external` | Only actions that leave the machine or mutate shared state: `git push`, `gh pr`, `gt`, terraform/tofu, kubectl, `vercel`/`flyctl`/`railway`. Local `rm -r*` no longer prompts. |
+| `off` | Nothing, including non-interactive child processes (which `strict` and `external` block rather than prompt). |
+
+Set it three ways, in precedence order:
+
+1. **One run:** `PI_PSTACK_CONFIRM=off pi` — also `strict` / `external`, plus the shorthand `0`/`false`/`none` and `1`/`true`. An unparseable value keeps the configured mode rather than silently dropping the gate.
+2. **This install:** `~/.pi/agent/pstack/config.json`:
+
+   ```json
+   { "confirm": { "mode": "external", "remember": "session" } }
+   ```
+
+3. **Right now:** `/pstack-confirm` reports the effective mode and where it came from; `/pstack-confirm off`, `/pstack-confirm external strict`, and `/pstack-confirm remember off` change and persist it.
+
+```console
+$ /pstack-confirm
+pstack confirm: external (config.json) · 6 patterns · remember=session · session grants: none
+```
+
+`remember` controls how often you are asked:
+
+- `session` *(default)* — the prompt is a three-way choice: **Allow once**, **Always allow this session**, **Deny**. Approving “always” adds the operation (for example `git push`) to an in-memory set that clears when the session ends, so a repeated command stops interrupting you without disabling the gate.
+- `off` — upstream behaviour: a yes/no dialog showing the full command, every time.
+
+When the mode is not `strict`, the footer shows `pstack: confirm off` or `pstack: confirm external` so a narrowed gate is never silent.
+
+The gate is deliberately unreachable from model-facing surfaces: neither the `pstack_config` tool nor `/setup-pstack` reads or writes `config.json`. A tool must not be able to lower the guard on its own actions.
+
 The upstream `watch-pr` and orchestration helper scripts are retained. Their runtime requirements remain project-specific. In particular, the script package uses Bun and GitHub workflows require `gh` authentication.
 
 ## License and provenance
