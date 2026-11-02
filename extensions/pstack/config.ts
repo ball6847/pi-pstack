@@ -1,6 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  isConfirmMode,
+  isRememberMode,
+  parseConfirmMode,
+  type ConfirmMode,
+  type RememberMode,
+} from "./policy.ts";
 
 export const ROLE_NAMES = [
   "feature, refactoring",
@@ -62,6 +69,81 @@ export async function writeConfig(config: PstackConfig): Promise<void> {
   const target = configPath();
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.writeFile(target, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+}
+
+/**
+ * The confirmation gate lives in its own file, next to models.json, so that
+ * `/setup-pstack` and the `pstack_config` tool never touch it. Nothing the
+ * model can call reads or writes this file: a tool must not be able to lower
+ * the guard on its own actions.
+ */
+export function confirmConfigPath(): string {
+  return path.join(getAgentDir(), "pstack", "config.json");
+}
+
+export interface ConfirmSettings {
+  mode: ConfirmMode;
+  remember: RememberMode;
+}
+
+export const DEFAULT_CONFIRM_SETTINGS: ConfirmSettings = { mode: "strict", remember: "session" };
+
+/** Where the effective mode came from. `env` outranks `config`, which outranks the default. */
+export type ConfirmSource = "env" | "config" | "default";
+
+export interface EffectiveConfirm {
+  settings: ConfirmSettings;
+  source: ConfirmSource;
+}
+
+/** The one-off override, for scripts and "just this run". */
+export function envConfirmMode(env: NodeJS.ProcessEnv = process.env): ConfirmMode | undefined {
+  return parseConfirmMode(env.PI_PSTACK_CONFIRM);
+}
+
+export async function readConfirmSettings(): Promise<{ settings: ConfirmSettings; source: "config" | "default" }> {
+  const fallback = { settings: { ...DEFAULT_CONFIRM_SETTINGS }, source: "default" as const };
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(confirmConfigPath(), "utf8"));
+    if (!parsed || typeof parsed !== "object") return fallback;
+    const confirm = (parsed as { confirm?: unknown }).confirm;
+    if (!confirm || typeof confirm !== "object") return fallback;
+    const record = confirm as Record<string, unknown>;
+    return {
+      settings: {
+        mode: isConfirmMode(record.mode) ? record.mode : DEFAULT_CONFIRM_SETTINGS.mode,
+        remember: isRememberMode(record.remember) ? record.remember : DEFAULT_CONFIRM_SETTINGS.remember,
+      },
+      source: "config",
+    };
+  } catch {
+    // Missing file, unreadable file, or invalid JSON: the safe default applies.
+    return fallback;
+  }
+}
+
+/** Merge a patch into `confirm` without disturbing any other key in config.json. */
+export async function writeConfirmSettings(patch: Partial<ConfirmSettings>): Promise<void> {
+  const target = confirmConfigPath();
+  let root: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(target, "utf8"));
+    if (parsed && typeof parsed === "object") root = parsed as Record<string, unknown>;
+  } catch {
+    // Start from scratch; a missing or broken file is not worth failing over.
+  }
+  const existing = root.confirm && typeof root.confirm === "object" ? (root.confirm as Record<string, unknown>) : {};
+  root.confirm = { ...existing, ...patch };
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.writeFile(target, `${JSON.stringify(root, null, 2)}\n`, { mode: 0o600 });
+}
+
+/** Resolve env over config over default. Never throws: an unreadable file falls back to `strict`. */
+export async function readEffectiveConfirm(): Promise<EffectiveConfirm> {
+  const { settings, source } = await readConfirmSettings();
+  const fromEnv = envConfirmMode();
+  if (fromEnv) return { settings: { ...settings, mode: fromEnv }, source: "env" };
+  return { settings, source };
 }
 
 export function modelsForRole(config: PstackConfig, role: string | undefined): string[] {

@@ -9,12 +9,35 @@ import type { Message } from "@earendil-works/pi-ai";
 import { getAgentDir, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { bundledAgentsDirectory, discoverAgents, projectAgentsDirectory, type AgentConfig, type AgentScope } from "./agents.ts";
-import { ROLE_NAMES, configPath, defaultConfig, modelsForRole, readConfig, writeConfig } from "./config.ts";
+import {
+  ROLE_NAMES,
+  configPath,
+  defaultConfig,
+  modelsForRole,
+  readConfig,
+  readEffectiveConfirm,
+  writeConfig,
+  writeConfirmSettings,
+  type ConfirmSettings,
+  type EffectiveConfirm,
+} from "./config.ts";
+import {
+  activePatterns,
+  matchOperation,
+  parseConfirmMode,
+  parseRememberMode,
+  previewCommand,
+} from "./policy.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
 const MODE_ENTRY = "pstack-mode";
+const CONFIRM_STATUS_KEY = "pstack-confirm";
+
+const OPTION_ALLOW_ONCE = "Allow once";
+const OPTION_ALLOW_ALWAYS = "Always allow this session";
+const OPTION_DENY = "Deny";
 
 const Task = Type.Object({
   agent: Type.String({ description: "Agent name. Use poteto-agent for pstack implementation delegates." }),
@@ -230,26 +253,32 @@ async function runLimited<T>(items: T[], callback: (item: T, index: number) => P
   return results;
 }
 
-function knownExternalWrite(command: string): string | undefined {
-  const patterns: Array<[RegExp, string]> = [
-    [/\bgit\s+push\b/, "git push"],
-    [/\bgh\s+pr\s+(create|edit|merge|close)\b/, "GitHub pull-request mutation"],
-    [/\bgt\s+(submit|merge|create)\b/, "Graphite mutation"],
-    [/\b(terraform|tofu)\s+(apply|destroy)\b/, "infrastructure mutation"],
-    [/\bkubectl\s+(apply|delete|rollout)\b/, "Kubernetes mutation"],
-    [/\b(vercel|flyctl|railway)\s+(deploy|promote)\b/, "deployment"],
-    [/\brm\s+(-[A-Za-z]*r|--recursive)/, "recursive deletion"],
-  ];
-  return patterns.find(([pattern]) => pattern.test(command))?.[1];
+/** Footer hint while the gate is narrower than `strict`. `strict` stays silent: it is the default. */
+function confirmStatusText(confirm: EffectiveConfirm): string | undefined {
+  if (confirm.settings.mode === "strict") return undefined;
+  return confirm.settings.mode === "off" ? "pstack: confirm off" : "pstack: confirm external";
 }
 
-export default function (pi: ExtensionAPI) {
+function formatConfirmStatus(confirm: EffectiveConfirm, grants: ReadonlySet<string>): string {
+  const patterns = activePatterns(confirm.settings.mode);
+  const source = confirm.source === "env" ? "PI_PSTACK_CONFIRM" : confirm.source === "config" ? "config.json" : "default";
+  const granted = grants.size ? [...grants].join(", ") : "none";
+  const count = `${patterns.length} pattern${patterns.length === 1 ? "" : "s"}`;
+  return `pstack confirm: ${confirm.settings.mode} (${source}) · ${count} · remember=${confirm.settings.remember} · session grants: ${granted}`;
+}
+
+export default async function (pi: ExtensionAPI) {
   let potetoMode = false;
   let todos: string[] = [];
+  let confirm: EffectiveConfirm = await readEffectiveConfirm();
+  // Operations the human approved for the rest of this session. Cleared on session_start.
+  const grantedOperations = new Set<string>();
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     potetoMode = false;
     todos = [];
+    grantedOperations.clear();
+    confirm = await readEffectiveConfirm();
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
       if (entry.customType === MODE_ENTRY) potetoMode = Boolean((entry.data as { enabled?: boolean }).enabled);
@@ -258,7 +287,10 @@ export default function (pi: ExtensionAPI) {
         if (Array.isArray(items) && items.every((item) => typeof item === "string")) todos = items;
       }
     }
-    if (ctx.mode === "tui") ctx.ui.setStatus("pstack-mode", potetoMode ? "pstack: poteto mode" : undefined);
+    if (ctx.mode === "tui") {
+      ctx.ui.setStatus("pstack-mode", potetoMode ? "pstack: poteto mode" : undefined);
+      ctx.ui.setStatus(CONFIRM_STATUS_KEY, confirmStatusText(confirm));
+    }
   });
 
   pi.on("input", (event) => {
@@ -279,11 +311,31 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "bash") return;
     const input = event.input as { command?: string };
-    const operation = input.command ? knownExternalWrite(input.command) : undefined;
+    const command = input.command ?? "";
+    const operation = matchOperation(command, confirm.settings.mode);
     if (!operation) return;
     if (!ctx.hasUI) return { block: true, reason: `${operation} requires explicit user confirmation; non-interactive Pi cannot request it.` };
-    const approved = await ctx.ui.confirm("Confirm external or irreversible action", `Allow ${operation}?\n\n${input.command}`);
-    if (!approved) return { block: true, reason: `User declined ${operation}.` };
+    if (confirm.settings.remember === "session" && grantedOperations.has(operation)) return;
+
+    // remember=off is exact upstream behaviour: yes/no, full command, ask every time.
+    if (confirm.settings.remember === "off") {
+      const approved = await ctx.ui.confirm("Confirm external or irreversible action", `Allow ${operation}?\n\n${command}`);
+      if (!approved) return { block: true, reason: `User declined ${operation}.` };
+      return;
+    }
+
+    const options = [
+      `${OPTION_ALLOW_ONCE} — ${previewCommand(command)}`,
+      `${OPTION_ALLOW_ALWAYS} — ${operation}`,
+      OPTION_DENY,
+    ];
+    const choice = await ctx.ui.select(`Confirm external or irreversible action — ${operation}`, options);
+    const index = choice === undefined ? -1 : options.indexOf(choice);
+    if (index === 1) {
+      grantedOperations.add(operation);
+      return;
+    }
+    if (index !== 0) return { block: true, reason: `User declined ${operation}.` };
   });
 
   pi.registerCommand("poteto-mode", {
@@ -322,6 +374,52 @@ export default function (pi: ExtensionAPI) {
       }
       await writeConfig(config);
       ctx.ui.notify(`Saved pstack model settings to ${configPath()}.`, "info");
+    },
+  });
+
+  pi.registerCommand("pstack-confirm", {
+    description:
+      "Show or change pstack's bash confirmation gate (config: ~/.pi/agent/pstack/config.json). Usage: /pstack-confirm [strict|external|off] [remember <on|off>]",
+    handler: async (args, ctx) => {
+      const usage = "Usage: /pstack-confirm | /pstack-confirm <strict|external|off> [remember <on|off>]";
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) {
+        ctx.ui.notify(formatConfirmStatus(confirm, grantedOperations));
+        return;
+      }
+
+      const patch: Partial<ConfirmSettings> = {};
+      for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        if (token === "remember") {
+          const remember = parseRememberMode(tokens[index + 1]);
+          if (!remember) {
+            ctx.ui.notify(`remember expects on|off. ${usage}`, "warning");
+            return;
+          }
+          patch.remember = remember;
+          index += 1;
+          continue;
+        }
+        const mode = parseConfirmMode(token);
+        if (!mode) {
+          ctx.ui.notify(`Unknown argument "${token}". ${usage}`, "warning");
+          return;
+        }
+        patch.mode = mode;
+      }
+
+      await writeConfirmSettings(patch);
+      confirm = await readEffectiveConfirm();
+      if (ctx.mode === "tui") ctx.ui.setStatus(CONFIRM_STATUS_KEY, confirmStatusText(confirm));
+      if (confirm.source === "env") {
+        ctx.ui.notify(
+          `Saved to config.json, but PI_PSTACK_CONFIRM=${process.env.PI_PSTACK_CONFIRM} overrides it until unset.`,
+          "warning",
+        );
+        return;
+      }
+      ctx.ui.notify(formatConfirmStatus(confirm, grantedOperations));
     },
   });
 
